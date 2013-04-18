@@ -1,0 +1,12 @@
+{
+  "name": "ano",
+  "version": "0.0.0",
+  "author": "François Colas <francoiscolas@gmail.com>",
+  "description": "A Node.js ORM.",
+  "keywords": ["mongo", "mongodb", "orm", "odm"],
+
+  "repository": {
+    "type": "git",
+    "url": "git://github.com/francoiscolas/ano.git"
+  }
+}

@@ -1,0 +1,230 @@
+var GENERIC_POOL = require('generic-pool');
+var va           = require('./va');
+
+var PostgreSQL = function (url) {
+    var _this = this;
+
+    this.url  = url;
+    this.pool = GENERIC_POOL.Pool({
+        min   : 0,
+        max   : 10,
+        create: function (callback) {
+            var PG = require('pg');
+            (new PG.Client(_this.url)).connect(callback);
+        },
+        destroy: function (client) {
+            client.end();
+        }
+    });
+};
+
+PostgreSQL.prototype.acquire = function (callback) {
+    this.pool.acquire(callback);
+};
+
+PostgreSQL.prototype.release = function (client) {
+    this.pool.release(client);
+};
+
+PostgreSQL.prototype.count = function (query, callback) {
+    var params = [];
+    var sql = 'SELECT COUNT(*) FROM ' + this._tableNameEscaped(query)
+        + this._where(query, params)
+        + this._order(query)
+        + this._range(query);
+
+    this._query(sql, params, function (error, result) {
+        if (error)
+            callback(error, 0);
+        else
+            callback(null, (result.rows[0].count));
+    });
+};
+
+PostgreSQL.prototype.exists = function (query, callback) {
+    var params = [];
+    var sql = 'SELECT 1 FROM ' + this._tableNameEscaped(query)
+        this._where(query, params) + ' LIMIT 1';
+
+    this._query(sql, params, function (error, result) {
+        if (error)
+            callback(error, false);
+        else
+            callback(null, (result.rows.length === 1));
+    });
+};
+
+PostgreSQL.prototype.forEach = function (query, callback) {
+    this._find(query, {inBulk: false}, callback);
+};
+
+PostgreSQL.prototype.toArray = function (query, callback) {
+    this._find(query, {inBulk: true}, callback);
+};
+
+PostgreSQL.prototype._find = function (query, options, callback) {
+    with (va(arguments, 'Object query', 'Object options=', 'Function callback')) {
+        var params = [];
+        var sql = 'SELECT * FROM ' + this._tableNameEscaped(query)
+            + this._where(query, params)
+            + this._order(query)
+            + this._range(query);
+
+        options || (options = {});
+        this._query(sql, params, {instantiate: true, inBulk: options.inBulk, modelClass: query.modelClass}, callback);
+    }
+};
+
+PostgreSQL.prototype._query = function (sql, params, options, callback) {
+    with (va(arguments, 'String sql', 'Array params=', 'Object options=', 'Function callback')) {
+        var that = this;
+
+        options || (options = {});
+        this.acquire(function (error, client) {
+            if (error)
+                return callback(error, null);
+            client.query(sql, params).on('row', function (row, result) {
+                if (options.instantiate) {
+                    var record = new options.modelClass(row);
+
+                    if (options.inBulk)
+                        result.addRow(record);
+                    else
+                        callback(null, record);
+                } else {
+                    result.addRow(row);
+                }
+            }).once('error', function (error) {
+                callback(error, null);
+            }).once('end', function (result) {
+                if (result) {
+                    if (options.instantiate) {
+                        if (options.inBulk)
+                            callback(null, result.rows);
+                    } else {
+                        callback(null, result);
+                    }
+                    that.release(client);
+                }
+            });
+        });
+        console.log(sql, params);
+    }
+};
+
+PostgreSQL.prototype._where = function (query, params) {
+    var sql = '';
+
+    if (query._conditions !== null) {
+        sql += (function it(object, logical) {
+            var list = [];
+
+            _forEach(object, function (value, key) {
+                if (!_isObject(value)) {
+                    list.push(' ' + key + ' = $' + params.push(value));
+                } else {
+                    switch (key) {
+                        case '$and':
+                            var result = [];
+
+                            _forEach(value, function (object) {
+                                result.push(it(object, ' AND'));
+                            });
+                            list.push(' (' + result.join(' AND') + ' )');
+                            break;
+                        case '$or' :
+                            var result = [];
+
+                            _forEach(value, function (object) {
+                                result.push(it(object, ' OR'));
+                            });
+                            list.push(' (' + result.join(' OR') + ' )');
+                            break;
+                        default:
+                            _forEach(value, function (comparison, value) {
+                                switch (comparison) {
+                                    case '$gt' : list.push(' ' + key + ' >  $' + params.push(value)); break;
+                                    case '$gte': list.push(' ' + key + ' >= $' + params.push(value)); break;
+                                    case '$lt' : list.push(' ' + key + ' <  $' + params.push(value)); break;
+                                    case '$lte': list.push(' ' + key + ' <= $' + params.push(value)); break;
+                                    case '$ne' : list.push(' ' + key + ' != $' + params.push(value)); break;
+                                    case '$in' :
+                                        var array = [];
+
+                                        value.forEach(function (value) {
+                                            array.push('$' + params.push(value));
+                                        });
+                                        list.push(' ' + key + ' IN (' + list.join(',') + ')');
+                                        break;
+                                    case '$nin':
+                                        var array = [];
+
+                                        value.forEach(function (value) {
+                                            array.push('$' + params.push(value));
+                                        });
+                                        list.push(' ' + key + ' NOT IN (' + list.join(',') + ')');
+                                        break;
+                                }
+                            });
+                            break;
+                    }
+                }
+            });
+            return list.join(logical);
+        })(query._conditions, ' AND');
+    }
+    return ((sql.length > 0) ? ' WHERE' : '') + sql;
+};
+
+PostgreSQL.prototype._order = function (query) {
+    var list = [];
+
+    _forEach(query._order, function (order, name) {
+        list.push(' ' + this._escapeName(name) + ' ' + ((order > 0) ? 'ASC' : 'DESC'));
+    });
+    return (list.length > 0) ? ' ORDER BY' + list.join(', ') : '';
+};
+
+PostgreSQL.prototype._range = function (query) {
+    var sql = '';
+
+    if (query._limit !== null)
+        sql += ' LIMIT ' + query._limit;
+    if (query._offset !== null)
+        sql += ' OFFSET ' + query._offset;
+    return sql;
+};
+
+PostgreSQL.prototype._tableName = function (query) {
+    var model_class = query.modelClass;
+    return model_class.tableName || model_class.modelName;
+};
+
+PostgreSQL.prototype._tableNameEscaped = function (query) {
+    return this._escapeName(this._tableName(query));
+};
+
+PostgreSQL.prototype._escapeName = function (name) {
+    return '"' + name + '"';
+};
+
+var _forEach = function (object, iterator, context) {
+    if (_isArray(object)) {
+        object.forEach(iterator, context);
+    } else if (_isObject(object)) {
+        for (var key in object) {
+            if (object.hasOwnProperty(key))
+                iterator.call(context, object[key], key, object);
+        }
+    }
+};
+
+var _isObject = function (object) {
+    return (object !== null && Object(object) === object);
+};
+
+var _isArray = function (object) {
+    return Array.isArray(object);
+};
+
+module.exports = PostgreSQL;
